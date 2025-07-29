@@ -448,21 +448,49 @@ void PostgresLocalState::ScanChunk(ClientContext &context, const PostgresBindDat
 		} else {
 			reader = make_uniq<PostgresBinaryReader>(connection, column_ids, bind_data);
 		}
+		if (PostgresConnection::DebugPrintQueries()) {
+			Printer::Print("DEBUG: PostgresLocalState::ScanChunk - Created " + 
+			               string(bind_data.use_text_protocol ? "text" : "binary") + " reader\n");
+		}
 	}
 	while (true) {
 		if (done && !PostgresParallelStateNext(context, &bind_data, *this, gstate)) {
+			if (PostgresConnection::DebugPrintQueries()) {
+				Printer::Print("DEBUG: PostgresLocalState::ScanChunk - Done and no more parallel state, returning\n");
+			}
 			return;
 		}
 		if (!exec) {
+			if (PostgresConnection::DebugPrintQueries()) {
+				Printer::Print("DEBUG: PostgresLocalState::ScanChunk - Calling reader->BeginCopy with SQL: " + sql + "\n");
+			}
 			reader->BeginCopy(sql);
 			exec = true;
+			if (PostgresConnection::DebugPrintQueries()) {
+				Printer::Print("DEBUG: PostgresLocalState::ScanChunk - BeginCopy completed\n");
+			}
+		}
+		if (PostgresConnection::DebugPrintQueries()) {
+			Printer::Print("DEBUG: PostgresLocalState::ScanChunk - About to call reader->Read, output.size()=" + 
+			               std::to_string(output.size()) + "\n");
 		}
 		auto read_result = reader->Read(output);
+		if (PostgresConnection::DebugPrintQueries()) {
+			Printer::Print("DEBUG: PostgresLocalState::ScanChunk - reader->Read returned: " + 
+			               string(read_result == PostgresReadResult::FINISHED ? "FINISHED" : "HAVE_MORE_TUPLES") + 
+			               ", output.size()=" + std::to_string(output.size()) + "\n");
+		}
 		if (read_result == PostgresReadResult::FINISHED) {
+			if (PostgresConnection::DebugPrintQueries()) {
+				Printer::Print("DEBUG: PostgresLocalState::ScanChunk - Read finished, setting done=true\n");
+			}
 			done = true;
 			continue;
 		}
 		if (output.size() == STANDARD_VECTOR_SIZE) {
+			if (PostgresConnection::DebugPrintQueries()) {
+				Printer::Print("DEBUG: PostgresLocalState::ScanChunk - Output chunk full, returning\n");
+			}
 			return;
 		}
 	}
