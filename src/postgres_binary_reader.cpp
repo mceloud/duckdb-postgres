@@ -13,26 +13,74 @@ PostgresBinaryReader::~PostgresBinaryReader() {
 }
 
 void PostgresBinaryReader::BeginCopy(const string &sql) {
-	con.BeginCopyFrom(sql, PGRES_COPY_OUT);
-	if (!Next()) {
-		throw IOException("Failed to fetch header for COPY \"%s\"", sql);
+	if (PostgresConnection::DebugPrintQueries()) {
+		Printer::Print("DEBUG: PostgresBinaryReader::BeginCopy starting with SQL: " + sql + "\n");
 	}
-	CheckHeader();
+	
+	try {
+		con.BeginCopyFrom(sql, PGRES_COPY_OUT);
+		if (PostgresConnection::DebugPrintQueries()) {
+			Printer::Print("DEBUG: BeginCopyFrom completed successfully, attempting to fetch header\n");
+		}
+		
+		if (!Next()) {
+			throw IOException("Failed to fetch header for COPY \"%s\"", sql);
+		}
+		
+		if (PostgresConnection::DebugPrintQueries()) {
+			Printer::Print("DEBUG: Header fetched successfully, checking header format\n");
+		}
+		
+		CheckHeader();
+		
+		if (PostgresConnection::DebugPrintQueries()) {
+			Printer::Print("DEBUG: Header check completed successfully\n");
+		}
+	} catch (const std::exception &e) {
+		if (PostgresConnection::DebugPrintQueries()) {
+			Printer::Print("DEBUG: Exception in PostgresBinaryReader::BeginCopy: " + string(e.what()) + "\n");
+		}
+		throw;
+	}
 }
 
 PostgresReadResult PostgresBinaryReader::Read(DataChunk &output) {
+	if (PostgresConnection::DebugPrintQueries()) {
+		Printer::Print("DEBUG: PostgresBinaryReader::Read - Starting, output.size()=" + std::to_string(output.size()) + 
+		               ", output.ColumnCount()=" + std::to_string(output.ColumnCount()) + "\n");
+	}
+	
+	idx_t rows_read_this_call = 0;
 	while (output.size() < STANDARD_VECTOR_SIZE) {
 		while (!Ready()) {
+			if (PostgresConnection::DebugPrintQueries()) {
+				Printer::Print("DEBUG: PostgresBinaryReader::Read - Buffer not ready (buffer_ptr=" + 
+				               std::to_string(reinterpret_cast<uintptr_t>(buffer_ptr)) + 
+				               ", end=" + std::to_string(reinterpret_cast<uintptr_t>(end)) + 
+				               "), calling Next()\n");
+			}
 			if (!Next()) {
-				// finished this batch
+				if (PostgresConnection::DebugPrintQueries()) {
+					Printer::Print("DEBUG: PostgresBinaryReader::Read - Next() returned false, copy finished. Rows read this call: " + 
+					               std::to_string(rows_read_this_call) + "\n");
+				}
 				return PostgresReadResult::FINISHED;
+			}
+			if (PostgresConnection::DebugPrintQueries()) {
+				Printer::Print("DEBUG: PostgresBinaryReader::Read - Next() returned true, buffer ready\n");
 			}
 		}
 
 		// read a row
 		auto tuple_count = ReadInteger<int16_t>();
+		if (PostgresConnection::DebugPrintQueries()) {
+			Printer::Print("DEBUG: PostgresBinaryReader::Read - Read tuple_count: " + std::to_string(tuple_count) + "\n");
+		}
 		if (tuple_count <= 0) {
 			// tuple_count of -1 signifies the file trailer (i.e. footer) - reset and skip
+			if (PostgresConnection::DebugPrintQueries()) {
+				Printer::Print("DEBUG: PostgresBinaryReader::Read - Found trailer/footer (tuple_count=" + std::to_string(tuple_count) + "), resetting\n");
+			}
 			Reset();
 			continue;
 		}
@@ -40,6 +88,9 @@ PostgresReadResult PostgresBinaryReader::Read(DataChunk &output) {
 		D_ASSERT(tuple_count == column_ids.size());
 
 		idx_t output_offset = output.size();
+		if (PostgresConnection::DebugPrintQueries()) {
+			Printer::Print("DEBUG: PostgresBinaryReader::Read - Processing row at output_offset: " + std::to_string(output_offset) + "\n");
+		}
 		for (idx_t output_idx = 0; output_idx < output.ColumnCount(); output_idx++) {
 			auto col_idx = column_ids[output_idx];
 			auto &out_vec = output.data[output_idx];
@@ -54,10 +105,48 @@ PostgresReadResult PostgresBinaryReader::Read(DataChunk &output) {
 				ReadValue(bind_data.types[col_idx], bind_data.postgres_types[col_idx], out_vec, output_offset);
 			}
 		}
-		Reset();
+		rows_read_this_call++;
 		output.SetCardinality(output_offset + 1);
+		if (PostgresConnection::DebugPrintQueries()) {
+			Printer::Print("DEBUG: PostgresBinaryReader::Read - Completed row, output.size()=" + std::to_string(output.size()) + 
+			               ", rows_read_this_call=" + std::to_string(rows_read_this_call) + 
+			               ", buffer_ptr=" + std::to_string(reinterpret_cast<uintptr_t>(buffer_ptr)) + 
+			               ", end=" + std::to_string(reinterpret_cast<uintptr_t>(end)) + 
+			               ", bytes_remaining=" + std::to_string(end - buffer_ptr) + "\n");
+		}
 	}
-	// we filled a chunk
+	
+	if (PostgresConnection::DebugPrintQueries()) {
+		Printer::Print("DEBUG: PostgresBinaryReader::Read - Chunk filled, checking if copy is actually finished\n");
+	}
+	
+	// We filled a chunk, but we need to check if there's actually more data
+	// to ensure we don't leave the copy operation incomplete
+	while (!Ready()) {
+		if (PostgresConnection::DebugPrintQueries()) {
+			Printer::Print("DEBUG: PostgresBinaryReader::Read - Buffer not ready after chunk fill (buffer_ptr=" + 
+			               std::to_string(reinterpret_cast<uintptr_t>(buffer_ptr)) + 
+			               ", end=" + std::to_string(reinterpret_cast<uintptr_t>(end)) + 
+			               "), calling Next()\n");
+		}
+		if (!Next()) {
+			// Copy operation is actually finished
+			if (PostgresConnection::DebugPrintQueries()) {
+				Printer::Print("DEBUG: PostgresBinaryReader::Read - Copy completed after filling chunk. Total rows read: " + 
+				               std::to_string(rows_read_this_call) + "\n");
+			}
+			return PostgresReadResult::FINISHED;
+		}
+		if (PostgresConnection::DebugPrintQueries()) {
+			Printer::Print("DEBUG: PostgresBinaryReader::Read - Next() returned true after chunk fill, more data available\n");
+		}
+	}
+	
+	// There is more data available, so we truly have more tuples
+	if (PostgresConnection::DebugPrintQueries()) {
+		Printer::Print("DEBUG: PostgresBinaryReader::Read - Returning HAVE_MORE_TUPLES, rows read this call: " + 
+		               std::to_string(rows_read_this_call) + "\n");
+	}
 	return PostgresReadResult::HAVE_MORE_TUPLES;
 }
 
@@ -66,17 +155,35 @@ bool PostgresBinaryReader::Next() {
 	char *out_buffer;
 	int len = PQgetCopyData(con.GetConn(), &out_buffer, 0);
 	auto new_buffer = data_ptr_cast(out_buffer);
+	
+	if (PostgresConnection::DebugPrintQueries()) {
+		Printer::Print("DEBUG: PostgresBinaryReader::Next() - PQgetCopyData returned len=" + std::to_string(len) + "\n");
+	}
 
 	// len -1 signals end
 	if (len == -1) {
+		if (PostgresConnection::DebugPrintQueries()) {
+			Printer::Print("DEBUG: PostgresBinaryReader::Next() - Copy data ended (len=-1), consuming remaining results\n");
+		}
 		// consume all available results
+		idx_t remaining_results = 0;
 		while (true) {
 			PostgresResult pg_res(PQgetResult(con.GetConn()));
 			auto final_result = pg_res.res;
 			if (!final_result) {
+				if (PostgresConnection::DebugPrintQueries()) {
+					Printer::Print("DEBUG: PostgresBinaryReader::Next() - No more results, consumed " + 
+					               std::to_string(remaining_results) + " remaining results\n");
+				}
 				break;
 			}
-			if (PQresultStatus(final_result) != PGRES_COMMAND_OK) {
+			remaining_results++;
+			auto result_status = PQresultStatus(final_result);
+			if (PostgresConnection::DebugPrintQueries()) {
+				Printer::Print("DEBUG: PostgresBinaryReader::Next() - Consumed remaining result " + 
+				               std::to_string(remaining_results) + " with status: " + std::to_string(result_status) + "\n");
+			}
+			if (result_status != PGRES_COMMAND_OK) {
 				throw IOException("Failed to fetch header for COPY: %s", string(PQresultErrorMessage(final_result)));
 			}
 		}
@@ -86,7 +193,16 @@ bool PostgresBinaryReader::Next() {
 	// len -2 is error
 	// we expect at least 2 bytes in each message for the tuple count
 	if (!new_buffer || len < sizeof(int16_t)) {
+		if (PostgresConnection::DebugPrintQueries()) {
+			Printer::Print("DEBUG: PostgresBinaryReader::Next() - Error: invalid buffer or length (len=" + 
+			               std::to_string(len) + ", buffer=" + (new_buffer ? "valid" : "null") + ")\n");
+		}
 		throw IOException("Unable to read binary COPY data from Postgres: %s", string(PQerrorMessage(con.GetConn())));
+	}
+	
+	if (PostgresConnection::DebugPrintQueries()) {
+		Printer::Print("DEBUG: PostgresBinaryReader::Next() - Got valid copy data, len=" + std::to_string(len) + 
+		               " bytes, setting up buffer\n");
 	}
 	buffer = new_buffer;
 	buffer_ptr = buffer;
@@ -104,7 +220,7 @@ void PostgresBinaryReader::Reset() {
 }
 
 bool PostgresBinaryReader::Ready() {
-	return buffer_ptr != nullptr;
+	return buffer_ptr != nullptr && buffer_ptr < end;
 }
 
 void PostgresBinaryReader::CheckHeader() {
