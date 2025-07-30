@@ -186,7 +186,7 @@ static void LoadInternal(DatabaseInstance &db) {
 	config.AddExtensionOption("pg_use_text_protocol",
 	                          "Whether or not to use TEXT protocol to read data. This is slower, but provides better "
 	                          "compatibility with non-Postgres systems",
-	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
 
 	OptimizerExtension postgres_optimizer;
 	postgres_optimizer.optimize_function = PostgresOptimizer::Optimize;
